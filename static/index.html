@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
+<body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
+<div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
+<div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
+<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
+<script>
+const out=document.querySelector('#output'), status=document.querySelector('#status');
+const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
+async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
+async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
+async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
+async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
+async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
+async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
+async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
+</script></body></html>

@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-gsb-35",
+  "projectName": "pair-wise-gsb-35",
+  "category": "困难 Python 项目",
+  "businessDomain": "测绘",
+  "projectForm": "完整项目",
+  "codeScope": "backend, frontend",
+  "languages": ["Python", "HTML", "CSS", "JavaScript"],
+  "summary": "大地测量观测管理与加权最小二乘网平差服务，支持审核发布、成果比较和异常观测标记。",
+  "containerized": false
+}
