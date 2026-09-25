@@ -1,19 +1,196 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
-<div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
-<div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
-<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差 · 异常复核台</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1100px;margin:32px auto;padding:0 18px;color:#16202a}
+input,select,button,textarea{padding:7px;margin:3px;font:inherit}
+button{cursor:pointer}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+pre{background:#f5f7f9;padding:12px;overflow:auto}
+small{color:#667}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}
+th,td{border:1px solid #d9e1e8;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f0f4f8}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600}
+.open{background:#fde8e8;color:#9b1c1c}.remeasure_planned{background:#fef3c7;color:#92400e}
+.excluded,.superseded,.rejected_remeasure{background:#e5e7eb;color:#374151}
+.remeasured,.valid,.cleared{background:#dcfce7;color:#166534}.outlier{background:#fee2e2;color:#991b1b}
+.actions{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start}
+textarea{width:96%}
+.muted{color:#667}.warn{color:#b91c1c;font-weight:600}.ok{color:#15803d;font-weight:600}
+.timeline{font-size:12px;color:#445}.timeline li{margin:2px 0}
+</style></head>
+<body>
+<h1>大地测量网平差 · 异常复核台</h1>
+<p>平差后逐条给出残差、限差和原因；作业员可安排复测或填依据排除并重算，原观测全部留档。异常处理完前不能提交复核。</p>
+
+<div class="card">
+  <h2>连接期次</h2>
+  期次 <input id="epoch" type="number" value="1" style="width:90px">
+  身份 <input id="user" value="alice" style="width:110px">
+  <select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select>
+  <button onclick="loadEpoch()">读取</button>
+  <span id="status"></span>
+</div>
+
+<div class="card">
+  <h2>平差</h2>
+  <button onclick="loadPoints()">点数据</button>
+  <button onclick="loadObservations()">全部观测（含留档）</button>
+  <button onclick="adjust()">执行平差</button>
+  <button onclick="loadResults()">平差结果</button>
+  <pre id="output">等待操作…</pre>
+</div>
+
+<div class="card">
+  <h2>异常复核台</h2>
+  <p class="muted">每条异常列出残差、限差（角度为角秒，距离/高差为米）与判定原因。
+    可「安排复测」后回填复测值，或填依据「排除并重算」；重算若观测不足或网形无解，沿用上次成果并返回拒因。</p>
+  <button onclick="loadReview()">刷新复核台</button>
+  <div id="gate"></div>
+  <div id="anomalies"></div>
+</div>
+
+<div class="card">
+  <h2>审核员视图</h2>
+  <p class="muted">审核员可看到每条异常的处理依据、处理经过、相邻两批成果的前后变化和本次采用集合；退回后这些记录仍保留。</p>
+  <div id="reviewer"></div>
+</div>
+
+<div class="card">
+  <h2>审核发布</h2>
+  <p class="muted">存在未处理异常或尚未平差时，「提交复核」会被拒绝。示例身份：alice=editor，bob=reviewer。</p>
+  <button onclick="transition('submit')">提交复核</button>
+  <button onclick="transition('approve')">批准</button>
+  <button onclick="transition('reject')">退回</button>
+  <button onclick="transition('publish')">发布</button>
+  <button onclick="loadAudit()">查看审计</button>
+</div>
+
 <script>
-const out=document.querySelector('#output'), status=document.querySelector('#status');
-const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
-async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
-async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
-async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
-async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
-async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
-async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
+const $=s=>document.querySelector(s);
+const out=$('#output'), statusEl=$('#status');
+const headers=()=>({'Content-Type':'application/json','X-User':$('#user').value,'X-Role':$('#role').value});
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=(v,d=4)=>v==null?'—':(typeof v==='number'?v.toFixed(d):v);
+const KIND={distance:'边长',angle:'角度',height_difference:'高差'};
+const OBS_STATUS={valid:'采用',outlier:'超差采用',excluded:'已排除',superseded:'复测停用',rejected_remeasure:'复测未采用'};
+
+async function api(url,opts={}){
+  const r=await fetch(url,opts); const j=await r.json();
+  if(!r.ok)throw Object.assign(new Error(j.error||r.status),{status:r.status,body:j});
+  return j;
+}
+async function showRaw(url,opts){try{const j=await api(url,opts);out.textContent=JSON.stringify(j,null,2);return j}catch(e){out.textContent='错误：'+e.message;throw e}}
+
+async function loadEpoch(){
+  try{const j=await api('/api/epochs/'+$('#epoch').value);
+    statusEl.innerHTML=' 状态：<b>'+esc(j.status)+'</b>';loadReview();}
+  catch(e){statusEl.textContent=' '+e.message}
+}
+const loadPoints=()=>showRaw('/api/epochs/'+$('#epoch').value+'/points');
+const loadObservations=()=>showRaw('/api/epochs/'+$('#epoch').value+'/observations');
+const loadResults=()=>showRaw('/api/epochs/'+$('#epoch').value+'/results');
+const loadAudit=()=>showRaw('/api/epochs/'+$('#epoch').value+'/audit');
+async function adjust(){try{await api('/api/epochs/'+$('#epoch').value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}catch(e){alert(e.message)}}
+async function transition(action){try{await api('/api/epochs/'+$('#epoch').value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}catch(e){alert(e.message)}}
+
+function target(o){return o.p1+'-'+o.p2+(o.p3?'-'+o.p3:'')}
+function num(v){return v==null||v===''?null:Number(v)}
+
+function anomalyCard(a,isDraft,role){
+  const o=a.observation, readonly = role!=='editor' || !isDraft;
+  let ops='';
+  if(!readonly && a.state==='open'){
+    ops=`<div class="actions">
+      <div><input id="note-${a.id}" placeholder="复测说明（选填）" style="width:200px">
+        <button onclick="schedule(${a.id})">安排复测</button></div>
+      <div style="flex:1;min-width:300px">
+        <textarea id="basis-${a.id}" rows="2" placeholder="排除依据（必填，≥5字，如：棱镜高记录错误经核对剔除）"></textarea>
+        <button onclick="exclude(${a.id})">填依据排除并重算</button></div>
+    </div>`;
+  } else if(!readonly && a.state==='remeasure_planned'){
+    ops=`<div class="actions">
+      <div>复测值 <input id="rv-${a.id}" type="number" step="any" value="${fmt(o.value,4)}" style="width:130px">
+        权 <input id="rw-${a.id}" type="number" step="any" style="width:70px" placeholder="沿用原权">
+        <button onclick="complete(${a.id})">回填复测值并重算</button></div></div>`;
+  } else {
+    ops=`<p class="muted">${readonly?'当前身份/状态不可操作（需 editor 且期次为草稿）':'该异常已处理完成'}</p>`;
+  }
+  const timeline=a.decisions.map(d=>{
+    const detail=d.action==='excluded'?('依据：'+esc(d.details.basis))
+      :d.action==='exclude_rejected'||d.action==='remeasure_schedule_rejected'||d.action==='remeasure_rejected'?('拒因：'+esc(d.details.reason))
+      :JSON.stringify(d.details);
+    return `<li>${esc(d.created_at)} · ${esc(d.actor)} · ${esc(d.action)} · ${detail}</li>`;
+  }).join('');
+  const basis=a.basis_text?`<p><b>排除依据：</b>${esc(a.basis_text)}</p>`:'';
+  const newObs=a.new_observation?`<p><b>复测新观测：</b>#${a.new_observation.id}，值 ${fmt(a.new_observation.value)}，状态 <span class="badge ${a.new_observation.status}">${esc(OBS_STATUS[a.new_observation.status]||a.new_observation.status)}</span></p>`:'';
+  const over=Math.abs(a.residual_display)>a.residual_limit_display;
+  return `<div class="card" style="margin:10px 0">
+    <h3>#${a.id} ${esc(a.kind_label)} ${esc(target(o))}（观测 #${o.id}）
+      <span class="badge ${a.state}">${esc(a.state_label)}</span></h3>
+    <table><tr><th>观测值</th><th>残差</th><th>限差 ±</th><th>单位</th><th>σ₀</th></tr>
+      <tr><td>${fmt(o.value)}</td>
+      <td class="${over?'warn':''}">${a.residual_display>=0?'+':''}${fmt(a.residual_display)}</td>
+      <td>${fmt(a.residual_limit_display)}</td><td>${esc(a.unit)}</td><td>${fmt(a.sigma0)}</td></tr></table>
+    <p>${esc(a.reason)}</p>
+    ${basis}${newObs}
+    ${ops}
+    <details><summary class="muted">处理经过（${a.decisions.length} 条，退回后仍保留）</summary>
+      <ul class="timeline">${timeline||'<li>暂无</li>'}</ul></details>
+  </div>`;
+}
+
+async function loadReview(){
+  try{
+    const b=await api('/api/epochs/'+$('#epoch').value+'/review-bundle');
+    const isDraft=b.epoch.status==='draft';
+    $('#gate').innerHTML = b.unresolved.length
+      ? `<p class="warn">⚠ 还有 ${b.unresolved.length} 条异常未处理完（待处理/已安排复测），不能提交复核。</p>`
+      : (b.run_count?`<p class="ok">✓ 异常已全部处理，可提交复核（共 ${b.run_count} 次平差）。</p>`
+                    :`<p class="warn">⚠ 尚未平差，不能提交复核。</p>`);
+    $('#anomalies').innerHTML = b.anomalies.length
+      ? b.anomalies.map(a=>anomalyCard(a,isDraft,$('#role').value)).join('')
+      : '<p class="muted">暂无异常记录（执行平差后生成）。</p>';
+
+    const adopted=b.adopted;
+    const rows=adopted.map(o=>`<tr><td>${o.id}</td><td>${esc(KIND[o.kind]||o.kind)}</td><td>${esc(target(o))}</td>
+      <td>${fmt(o.value)}</td><td>${fmt(o.weight,2)}</td><td>${fmt(o.residual)}</td>
+      <td><span class="badge ${o.status}">${esc(OBS_STATUS[o.status]||o.status)}</span></td></tr>`).join('');
+    let ba='';
+    if(b.before_after){
+      const c=b.before_after;
+      ba=`<h3>前后变化（批次 #${c.previous_run_id} → #${c.latest_run_id}）</h3>
+        <p>σ₀：${fmt(c.sigma0_before)} → ${fmt(c.sigma0_after)}；残差 RMS：${fmt(c.rms_before)} → ${fmt(c.rms_after)}</p>
+        <table><tr><th>点</th><th>Δx</th><th>Δy</th><th>Δ高程</th></tr>
+        ${c.points.map(p=>`<tr><td>${esc(p.point)}</td><td>${fmt(p.dx)}</td><td>${fmt(p.dy)}</td><td>${fmt(p.delevation)}</td></tr>`).join('')}
+        </table>`;
+    }
+    const runs=b.runs.map(r=>`<tr><td>${r.run_id}</td><td>${esc(r.trigger)}</td><td>${esc(r.created_by)}</td>
+      <td>${esc(r.created_at)}</td><td>${fmt(r.sigma0)}</td><td>${fmt(r.residual_rms)}</td></tr>`).join('');
+    const basisList=b.anomalies.filter(a=>a.basis_text)
+      .map(a=>`<li>#${a.id} ${esc(a.observation.kind_label||'')} ${esc(target(a.observation))}：${esc(a.basis_text)}</li>`).join('');
+    $('#reviewer').innerHTML=`
+      <p>期次状态 <b>${esc(b.epoch.status)}</b>；最近批次 #${b.latest_run?b.latest_run.run_id:'—'}，未决异常 ${b.unresolved.length} 条。</p>
+      <h3>排除依据汇总</h3><ul>${basisList||'<li class="muted">无</li>'}</ul>
+      ${ba}
+      <h3>本次采用集合（${adopted.length} 条；已排除/复测停用的观测仍可在“全部观测”中查档）</h3>
+      <table><tr><th>#</th><th>类型</th><th>端点</th><th>观测值</th><th>权</th><th>残差</th><th>状态</th></tr>${rows}</table>
+      <details><summary class="muted">平差批次历史（${b.runs.length}）</summary>
+      <table><tr><th>批次</th><th>触发</th><th>操作人</th><th>时间</th><th>σ₀</th><th>RMS</th></tr>${runs}</table></details>`;
+  }catch(e){$('#anomalies').innerHTML=`<p class="warn">${esc(e.message)}</p>`;$('#reviewer').innerHTML=''}
+}
+
+async function act(id,path,payload){
+  try{
+    await api(`/api/epochs/${$('#epoch').value}/anomalies/${id}/${path}`,
+      {method:'POST',headers:headers(),body:JSON.stringify(payload)});
+    loadEpoch();
+  }catch(e){alert(e.message);loadReview()}
+}
+const schedule=id=>act(id,'schedule-remeasure',{note:$('#note-'+id)?.value||''});
+const exclude=id=>act(id,'exclude',{basis:$('#basis-'+id).value});
+const complete=id=>act(id,'complete-remeasure',{value:num($('#rv-'+id).value),weight:num($('#rw-'+id).value)});
+
+loadEpoch();
 </script></body></html>
