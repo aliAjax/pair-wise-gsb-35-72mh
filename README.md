@@ -22,7 +22,11 @@ python app.py --port 8006
 - `POST /api/epochs`：创建期次。
 - `POST /api/epochs/{id}/points`：设置已知点或未知点近似坐标。
 - `POST /api/epochs/{id}/observations`：录入 `distance`、`angle`、`height_difference` 观测；疑似重复值会返回 409。
-- `POST /api/epochs/{id}/adjust`：迭代加权最小二乘平差；残差超过 3.5 倍单位权中误差的观测标记为 `outlier`。
+- `POST /api/epochs/{id}/adjust`：迭代加权最小二乘平差；残差超过 3.5 倍单位权中误差的观测标记为 `outlier`，并生成异常复核单。
+- `GET /api/epochs/{id}/outliers`：异常复核台列表，逐条给出残差、限差、原因、状态和处理依据。
+- `POST /api/epochs/{id}/outliers/{case_id}/remeasure`：安排复测（可附说明），观测仍保留在采用集合中。
+- `POST /api/epochs/{id}/outliers/{case_id}/exclude`：填依据排除观测并重算；原观测以 `excluded` 状态留档。重算若观测不足或网形秩亏，整体回滚、沿用上次成果并返回拒因。
+- `GET /api/epochs/{id}/review`：审核视图，汇总异常依据、排除前后点位变化、当前采用集合和平差成果。
 - `POST /api/epochs/{id}/transition/submit|approve|reject|publish`：审核发布状态机。
 - `GET /api/epochs/{id}/results`：查看点位坐标和精度。
 - `GET /api/epochs/{id}/compare/{other_id}`：比较两期成果。
@@ -33,6 +37,9 @@ python app.py --port 8006
 - 只有在 `draft` 状态可修改点、观测和重新平差；提交后必须由非创建人、非提交人的 `reviewer` 批准才能发布。
 - 同类型、同端点、容差内的观测被视为重复；确实需要保留时可在请求体传 `allow_duplicate: true`。
 - 法方程秩亏或坐标不可解时返回 422，不会写出平差结果。
+- 异常观测在排除前仍参与平差；存在未处理（`pending`）的异常复核单时不能提交复核。
+- 排除异常必须填写依据；排除和重算在同一事务内完成，失败时观测、成果和复核单全部回滚。
+- 复核单记录排除前后的点位变化和采用集合，退回（reject）只改变期次状态，异常处理记录和已排除观测全部保留。
 - 每期结果独立保存，发布只改变期次状态，不删除历史观测。
 
 ## 测试
@@ -41,4 +48,4 @@ python app.py --port 8006
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖完整示例平差、提交审核发布、重复观测冲突和越权操作。
+测试覆盖完整示例平差、提交审核发布、重复观测冲突、越权操作，以及异常复核台的开单、复测、排除重算、重算失败回滚、提交门禁和退回后记录保留。

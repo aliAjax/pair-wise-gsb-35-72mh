@@ -1,19 +1,46 @@
 <!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #d9e1e8;padding:4px 8px;font-size:14px;text-align:left}.pending{color:#b23;font-weight:600}</style></head>
 <body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
 <div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
 <div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
-<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
+<div class="card"><h2>异常复核台</h2><p><small>平差后逐条列出异常观测的残差、限差和原因。可安排复测，或填写依据后排除并重算（原观测留档）；重算失败会沿用上次成果并给出拒因。存在未处理异常时不能提交复核。</small></p>
+<button onclick="loadOutliers()">刷新异常</button><button onclick="loadReview()">审核视图</button><div id="cases"></div><pre id="review"></pre></div>
+<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('reject')">退回</button><button onclick="transition('publish')">发布</button></div>
 <script>
-const out=document.querySelector('#output'), status=document.querySelector('#status');
+const out=document.querySelector('#output'), status=document.querySelector('#status'), casesDiv=document.querySelector('#cases'), reviewOut=document.querySelector('#review');
 const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
 async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
 async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
 async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
 async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
 async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
-async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
+async function adjust(){try{await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'})}finally{loadEpoch();loadOutliers()}}
+async function transition(action){try{await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'})}finally{loadEpoch()}}
+const desc=o=>`${o.kind} ${o.p1}-${o.p2}${o.p3?'-'+o.p3:''} = ${o.value}`;
+async function loadOutliers(){
+  try{
+    const j=await req('/api/epochs/'+epoch.value+'/outliers');
+    if(!j.cases.length){casesDiv.innerHTML='<p>暂无异常观测。</p>';return}
+    casesDiv.innerHTML='<table><tr><th>单号</th><th>观测</th><th>残差</th><th>限差</th><th>原因</th><th>状态</th><th>依据</th><th>操作</th></tr>'+j.cases.map(c=>{
+      const acts=c.status==='pending'?`<input id="note-${c.id}" placeholder="依据/说明"><button onclick="decide(${c.id},'remeasure')">安排复测</button><button onclick="decide(${c.id},'exclude')">排除并重算</button>`:'';
+      const note=c.decision_note?`${c.decision_note}${c.decided_by?'（'+c.decided_by+'）':''}`:'';
+      return `<tr><td>#${c.id}</td><td>${desc(c)}</td><td>${Number(c.residual).toFixed(4)}</td><td>${Number(c.limit_value).toFixed(4)}</td><td>${c.reason}</td><td class="${c.status==='pending'?'pending':''}">${c.status}</td><td>${note}</td><td>${acts}</td></tr>`;
+    }).join('')+'</table>';
+  }catch(e){casesDiv.innerHTML='<p>'+e.message+'</p>'}
+}
+async function decide(id,action){
+  const el=document.querySelector('#note-'+id), note=el?el.value:'';
+  try{await req(`/api/epochs/${epoch.value}/outliers/${id}/${action}`,{method:'POST',headers:headers(),body:JSON.stringify({note})})}catch(e){/* 拒因等错误已显示在上方输出区 */}finally{loadOutliers()}
+}
+async function loadReview(){
+  try{
+    const j=await req('/api/epochs/'+epoch.value+'/review');
+    reviewOut.textContent=JSON.stringify(j,null,2);
+    const shifts=c=>c.changes&&c.changes.shifts?c.changes.shifts.map(s=>`${s.point}: dx=${s.dx.toFixed(4)} dy=${s.dy.toFixed(4)} dz=${s.delevation.toFixed(4)}`).join('；'):'';
+    casesDiv.innerHTML=`<p>未处理异常 ${j.pending_count} 条；采用集合 ${j.adopted_ids.length} 条（观测编号：${j.adopted_ids.join(', ')||'无'}）。</p>`+
+      '<ul>'+j.cases.map(c=>`<li>#${c.id} ${desc(c)}［${c.status}］${c.decision_note?' 依据：'+c.decision_note:''}${c.changes?' 前后变化：'+shifts(c):''}</li>`).join('')+'</ul>';
+  }catch(e){casesDiv.innerHTML='<p>'+e.message+'</p>'}
+}
 </script></body></html>

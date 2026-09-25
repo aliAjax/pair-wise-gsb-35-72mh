@@ -149,6 +149,22 @@ class Database:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS outlier_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch_id INTEGER NOT NULL REFERENCES epochs(id) ON DELETE CASCADE,
+                    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+                    residual REAL NOT NULL,
+                    std_residual REAL NOT NULL,
+                    limit_value REAL NOT NULL,
+                    sigma0 REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    decision_note TEXT,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    changes TEXT,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -276,6 +292,11 @@ class Database:
             if action == "submit":
                 if role != "editor" or status != "draft":
                     raise DomainError("只有草稿可由编辑提交复核", 409)
+                pending = conn.execute(
+                    "SELECT COUNT(*) AS n FROM outlier_cases WHERE epoch_id=? AND status='pending'", (epoch_id,)
+                ).fetchone()["n"]
+                if pending:
+                    raise DomainError(f"存在 {pending} 条未处理的异常观测，处理完成后才能提交复核", 409)
                 conn.execute("UPDATE epochs SET status='review',submitted_by=? WHERE id=?", (actor, epoch_id))
             elif action == "approve":
                 if role != "reviewer" or status != "review":
@@ -368,63 +389,225 @@ class Database:
         if role != "editor":
             raise DomainError("只有编辑人员可以执行平差", 403)
         with self.connect() as conn:
-            epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT status FROM epochs WHERE id=?", (epoch_id,)).fetchone()
             if not epoch:
                 raise DomainError("期次不存在", 404)
             if epoch["status"] != "draft":
                 raise DomainError("只有草稿期次可以平差", 409)
-            point_rows = conn.execute("SELECT * FROM points WHERE epoch_id=?", (epoch_id,)).fetchall()
-            observations = conn.execute("SELECT * FROM observations WHERE epoch_id=? AND status='valid'", (epoch_id,)).fetchall()
-            if len(observations) < 2:
-                raise DomainError("至少需要两条有效观测")
-            points = {r["point"]: {**dict(r), "x": r["x"], "y": r["y"], "elevation": r["elevation"]} for r in point_rows}
-            for p in points.values():
-                for comp in ("x", "y", "elevation"):
-                    if p[comp] is None:
-                        p[comp] = 0.0 if comp != "elevation" else 0.0
-            iteration = 0
-            residuals: list[float] = []
-            unknown: dict[tuple[str, str], int] = {}
-            sigma0 = 1.0
-            covariance: list[list[float]] = []
-            while iteration < 12:
-                unknown, normal, rhs, residuals = self._linear_system(points, observations)
-                if not unknown:
-                    break
-                delta = _solve(normal, rhs)
-                for (point, comp), idx in unknown.items():
-                    points[point][comp] += delta[idx]
-                iteration += 1
-                if max((abs(v) for v in delta), default=0.0) < 1e-7:
-                    break
+            return self._adjust_on_conn(conn, epoch_id, actor)
+
+    def _adjust_on_conn(self, conn: sqlite3.Connection, epoch_id: int, actor: str) -> dict[str, Any]:
+        """在调用方事务内完成平差并刷新成果、残差和异常复核单。
+
+        任何 DomainError 都由调用方回滚，已有成果保持不变（沿用上次成果）。
+        排除（excluded）的观测不参与解算但保留在档案中。
+        """
+        point_rows = conn.execute("SELECT * FROM points WHERE epoch_id=?", (epoch_id,)).fetchall()
+        observations = conn.execute(
+            "SELECT * FROM observations WHERE epoch_id=? AND status IN ('valid','outlier')", (epoch_id,)
+        ).fetchall()
+        if len(observations) < 2:
+            raise DomainError("至少需要两条有效观测")
+        points = {r["point"]: {**dict(r), "x": r["x"], "y": r["y"], "elevation": r["elevation"]} for r in point_rows}
+        for p in points.values():
+            for comp in ("x", "y", "elevation"):
+                if p[comp] is None:
+                    p[comp] = 0.0 if comp != "elevation" else 0.0
+        iteration = 0
+        residuals: list[float] = []
+        unknown: dict[tuple[str, str], int] = {}
+        sigma0 = 1.0
+        covariance: list[list[float]] = []
+        normal: list[list[float]] = []
+        while iteration < 12:
+            unknown, normal, rhs, residuals = self._linear_system(points, observations)
             if not unknown:
-                _, _, _, residuals = self._linear_system(points, observations)
-            redundancy = max(1, len(observations) - len(unknown))
-            weighted_ss = sum(float(o["weight"]) * r * r for o, r in zip(observations, residuals))
-            sigma0 = math.sqrt(weighted_ss / redundancy)
-            covariance = _inverse(normal) if unknown else []
-            if unknown:
-                covariance = [[v * sigma0 * sigma0 for v in row] for row in covariance]
-            rms = math.sqrt(sum(r * r for r in residuals) / len(residuals)) if residuals else 0.0
-            stamped = utcnow()
-            conn.execute("DELETE FROM results WHERE epoch_id=?", (epoch_id,))
-            by_point = {point: {"point": point, "x": p["x"], "y": p["y"], "elevation": p["elevation"],
-                                "sigma_x": 0.0, "sigma_y": 0.0, "sigma_elevation": 0.0} for point, p in points.items()}
+                break
+            delta = _solve(normal, rhs)
             for (point, comp), idx in unknown.items():
-                by_point[point][f"sigma_{comp}"] = math.sqrt(max(0.0, covariance[idx][idx]))
-            for result in by_point.values():
+                points[point][comp] += delta[idx]
+            iteration += 1
+            if max((abs(v) for v in delta), default=0.0) < 1e-7:
+                break
+        if not unknown:
+            _, _, _, residuals = self._linear_system(points, observations)
+        redundancy = max(1, len(observations) - len(unknown))
+        weighted_ss = sum(float(o["weight"]) * r * r for o, r in zip(observations, residuals))
+        sigma0 = math.sqrt(weighted_ss / redundancy)
+        covariance = _inverse(normal) if unknown else []
+        if unknown:
+            covariance = [[v * sigma0 * sigma0 for v in row] for row in covariance]
+        rms = math.sqrt(sum(r * r for r in residuals) / len(residuals)) if residuals else 0.0
+        stamped = utcnow()
+        conn.execute("DELETE FROM results WHERE epoch_id=?", (epoch_id,))
+        by_point = {point: {"point": point, "x": p["x"], "y": p["y"], "elevation": p["elevation"],
+                            "sigma_x": 0.0, "sigma_y": 0.0, "sigma_elevation": 0.0} for point, p in points.items()}
+        for (point, comp), idx in unknown.items():
+            by_point[point][f"sigma_{comp}"] = math.sqrt(max(0.0, covariance[idx][idx]))
+        for result in by_point.values():
+            conn.execute(
+                """INSERT INTO results(epoch_id,point,x,y,elevation,sigma_x,sigma_y,sigma_elevation,residual_rms,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (epoch_id, result["point"], result["x"], result["y"], result["elevation"], result["sigma_x"],
+                 result["sigma_y"], result["sigma_elevation"], rms, stamped),
+            )
+        outliers: list[dict[str, Any]] = []
+        has_redundancy = len(observations) - len(unknown) > 0
+        for obs, residual in zip(observations, residuals):
+            weight = float(obs["weight"])
+            std = math.sqrt(weight) * residual
+            limit = 3.5 * max(sigma0, 1e-12)
+            is_outlier = has_redundancy and abs(std) > limit
+            sigma_res = abs(residual) / math.sqrt(max(weight, 1e-12))
+            conn.execute("UPDATE observations SET residual=?,sigma=?,status=? WHERE id=?",
+                         (residual, sigma_res, "outlier" if is_outlier else "valid", obs["id"]))
+            if is_outlier:
+                outliers.append({"id": obs["id"], "residual": residual, "std": std, "limit": limit, "sigma0": sigma0})
+        created, resolved = self._sync_outlier_cases(conn, epoch_id, outliers)
+        self._audit(conn, epoch_id, actor, "network.adjusted",
+                    {"iterations": iteration, "rms": rms, "outliers": len(outliers),
+                     "new_cases": created, "resolved_cases": resolved})
+        return {"epoch_id": epoch_id, "iterations": iteration, "residual_rms": rms, "sigma0": sigma0,
+                "outliers": len(outliers), "points": list(by_point.values())}
+
+    def _sync_outlier_cases(self, conn: sqlite3.Connection, epoch_id: int, outliers: list[dict[str, Any]]) -> tuple[int, int]:
+        """按本次平差结果同步异常复核单：新异常开单，恢复正常的挂单自动关闭。"""
+        stamped = utcnow()
+        pending = conn.execute("SELECT * FROM outlier_cases WHERE epoch_id=? AND status='pending'", (epoch_id,)).fetchall()
+        current = {item["id"] for item in outliers}
+        resolved = 0
+        for case in pending:
+            if case["observation_id"] not in current:
                 conn.execute(
-                    """INSERT INTO results(epoch_id,point,x,y,elevation,sigma_x,sigma_y,sigma_elevation,residual_rms,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (epoch_id, result["point"], result["x"], result["y"], result["elevation"], result["sigma_x"],
-                     result["sigma_y"], result["sigma_elevation"], rms, stamped),
+                    "UPDATE outlier_cases SET status='resolved',decision_note=?,decided_by='system',decided_at=? WHERE id=?",
+                    ("重算后不再是异常，自动关闭", stamped, case["id"]),
                 )
-            for obs, residual in zip(observations, residuals):
-                sigma_res = abs(residual) / math.sqrt(max(float(obs["weight"]), 1e-12))
-                status = "outlier" if len(observations) - len(unknown) > 0 and abs(math.sqrt(float(obs["weight"])) * residual) > 3.5 * max(sigma0, 1e-12) else "valid"
-                conn.execute("UPDATE observations SET residual=?,sigma=?,status=? WHERE id=?", (residual, sigma_res, status, obs["id"]))
-            self._audit(conn, epoch_id, actor, "network.adjusted", {"iterations": iteration, "rms": rms, "outliers": sum(1 for o, r in zip(observations, residuals) if abs(math.sqrt(float(o["weight"])) * r) > 3.5 * max(sigma0, 1e-12))})
-            return {"epoch_id": epoch_id, "iterations": iteration, "residual_rms": rms, "sigma0": sigma0, "points": list(by_point.values())}
+                resolved += 1
+        created = 0
+        for item in outliers:
+            handled = conn.execute(
+                "SELECT 1 FROM outlier_cases WHERE epoch_id=? AND observation_id=? AND status IN ('pending','remeasure','excluded')",
+                (epoch_id, item["id"]),
+            ).fetchone()
+            if handled:
+                continue
+            reason = f"标准化残差 {abs(item['std']):.3f} 超过限差 {item['limit']:.3f}（3.5σ₀，σ₀={item['sigma0']:.4f}）"
+            conn.execute(
+                """INSERT INTO outlier_cases(epoch_id,observation_id,residual,std_residual,limit_value,sigma0,reason,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (epoch_id, item["id"], item["residual"], item["std"], item["limit"], item["sigma0"], reason, stamped),
+            )
+            created += 1
+        return created, resolved
+
+    def list_outlier_cases(self, epoch_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT c.*, o.kind, o.p1, o.p2, o.p3, o.value, o.weight, o.status AS observation_status
+                   FROM outlier_cases c JOIN observations o ON o.id=c.observation_id
+                   WHERE c.epoch_id=? ORDER BY c.id""",
+                (epoch_id,),
+            ).fetchall()
+        cases = []
+        for row in rows:
+            item = dict(row)
+            item["changes"] = json.loads(item["changes"]) if item.get("changes") else None
+            cases.append(item)
+        return cases
+
+    def get_outlier_case(self, epoch_id: int, case_id: int) -> dict[str, Any]:
+        for case in self.list_outlier_cases(epoch_id):
+            if case["id"] == case_id:
+                return case
+        raise DomainError("异常记录不存在", 404)
+
+    def _draft_case(self, conn: sqlite3.Connection, epoch_id: int, case_id: int) -> sqlite3.Row:
+        epoch = conn.execute("SELECT status FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+        if not epoch:
+            raise DomainError("期次不存在", 404)
+        if epoch["status"] != "draft":
+            raise DomainError("只有草稿期次可以处理异常观测", 409)
+        case = conn.execute("SELECT * FROM outlier_cases WHERE id=? AND epoch_id=?", (case_id, epoch_id)).fetchone()
+        if not case:
+            raise DomainError("异常记录不存在", 404)
+        return case
+
+    def remeasure_outlier(self, epoch_id: int, case_id: int, actor: str, note: str = "", role: str = "editor") -> dict[str, Any]:
+        if role != "editor":
+            raise DomainError("只有编辑人员可以处理异常观测", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            case = self._draft_case(conn, epoch_id, case_id)
+            if case["status"] != "pending":
+                raise DomainError("该异常已处理，不能重复安排", 409)
+            note = (note or "").strip() or "安排复测，补测成果返回前暂缓采用"
+            conn.execute(
+                "UPDATE outlier_cases SET status='remeasure',decision_note=?,decided_by=?,decided_at=? WHERE id=?",
+                (note, actor, utcnow(), case_id),
+            )
+            self._audit(conn, epoch_id, actor, "outlier.remeasure",
+                        {"case_id": case_id, "observation_id": case["observation_id"], "note": note})
+        return self.get_outlier_case(epoch_id, case_id)
+
+    def exclude_outlier(self, epoch_id: int, case_id: int, actor: str, note: str, role: str = "editor") -> dict[str, Any]:
+        """填依据排除异常观测并在同一事务内重算；重算失败则整体回滚，沿用上次成果。"""
+        if role != "editor":
+            raise DomainError("只有编辑人员可以处理异常观测", 403)
+        note = (note or "").strip()
+        if not note:
+            raise DomainError("排除异常观测必须填写依据")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            case = self._draft_case(conn, epoch_id, case_id)
+            if case["status"] not in {"pending", "remeasure"}:
+                raise DomainError("该异常已处理", 409)
+            obs = conn.execute("SELECT * FROM observations WHERE id=?", (case["observation_id"],)).fetchone()
+            if not obs or obs["status"] == "excluded":
+                raise DomainError("观测已被排除", 409)
+            before = {r["point"]: dict(r) for r in conn.execute("SELECT * FROM results WHERE epoch_id=?", (epoch_id,)).fetchall()}
+            before_rms = before[next(iter(before))]["residual_rms"] if before else None
+            conn.execute("UPDATE observations SET status='excluded' WHERE id=?", (obs["id"],))
+            try:
+                adjustment = self._adjust_on_conn(conn, epoch_id, actor)
+            except DomainError as exc:
+                raise DomainError(f"重算失败，已沿用上次成果：{exc}", exc.status) from exc
+            after = {r["point"]: dict(r) for r in conn.execute("SELECT * FROM results WHERE epoch_id=?", (epoch_id,)).fetchall()}
+            shifts = [
+                {"point": point,
+                 "dx": after[point]["x"] - before[point]["x"],
+                 "dy": after[point]["y"] - before[point]["y"],
+                 "delevation": after[point]["elevation"] - before[point]["elevation"]}
+                for point in sorted(set(before) & set(after))
+            ]
+            adopted = [r["id"] for r in conn.execute(
+                "SELECT id FROM observations WHERE epoch_id=? AND status IN ('valid','outlier') ORDER BY id", (epoch_id,)).fetchall()]
+            changes = {"excluded_observation_id": obs["id"], "before_rms": before_rms,
+                       "after_rms": adjustment["residual_rms"], "shifts": shifts, "adopted_ids": adopted}
+            conn.execute(
+                "UPDATE outlier_cases SET status='excluded',decision_note=?,decided_by=?,decided_at=?,changes=? WHERE id=?",
+                (note, actor, utcnow(), json.dumps(changes, ensure_ascii=False), case_id),
+            )
+            self._audit(conn, epoch_id, actor, "outlier.excluded",
+                        {"case_id": case_id, "observation_id": obs["id"], "note": note,
+                         "before_rms": before_rms, "after_rms": adjustment["residual_rms"]})
+        return {"case": self.get_outlier_case(epoch_id, case_id), "adjustment": adjustment, "changes": changes}
+
+    def review_summary(self, epoch_id: int) -> dict[str, Any]:
+        """审核视图：异常依据、排除前后变化和当前采用集合。"""
+        epoch = self.get_epoch(epoch_id)
+        cases = self.list_outlier_cases(epoch_id)
+        observations = self.list_observations(epoch_id)
+        for obs in observations:
+            obs["used"] = obs["status"] != "excluded"
+        return {
+            "epoch": epoch,
+            "pending_count": sum(1 for c in cases if c["status"] == "pending"),
+            "cases": cases,
+            "observations": observations,
+            "adopted_ids": [o["id"] for o in observations if o["used"]],
+            "results": self.results(epoch_id),
+        }
 
     def results(self, epoch_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -532,6 +715,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"results": self.db.results(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "audit":
                 return self._json({"audit": self.db.audit(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "outliers":
+                return self._json({"cases": self.db.list_outlier_cases(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "review":
+                return self._json(self.db.review_summary(int(parts[2])))
             if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "compare":
                 return self._json({"comparison": self.db.compare(int(parts[2]), int(parts[4]))})
             raise DomainError("接口不存在", 404)
@@ -549,6 +736,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.db.get_epoch(epoch_id), 201)
             if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "transition":
                 return self._json(self.db.transition(int(parts[2]), actor, role, parts[4]))
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "outliers" and parts[5] in {"remeasure", "exclude"}:
+                epoch_id, case_id = int(parts[2]), int(parts[4])
+                note = str(body.get("note") or "")
+                if parts[5] == "remeasure":
+                    return self._json(self.db.remeasure_outlier(epoch_id, case_id, actor, note, role))
+                return self._json(self.db.exclude_outlier(epoch_id, case_id, actor, note, role))
             if len(parts) == 4 and parts[:2] == ["api", "epochs"]:
                 epoch_id = int(parts[2])
                 if parts[3] == "points":
